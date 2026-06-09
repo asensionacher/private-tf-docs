@@ -1,0 +1,309 @@
+---
+title: Runners Setup
+description: Set up and configure the private-tf-runners deployment platform.
+---
+
+# Private TF Runners
+
+Self-hosted Terraform/OpenTofu deployment platform with a web UI for managing stacks, runs, and runners.
+
+## Architecture
+
+- **Backend**: Go + Gin framework (port 8080)
+- **Frontend**: React + TypeScript + TailwindCSS
+- **Database**: SQLite (embedded)
+- **Reverse Proxy**: Nginx (SSL termination)
+- **Security**: JWT authentication, CSRF protection, role-based access control
+
+## Quick Start
+
+### 1. Create external network
+
+```bash
+cd ../private-tf-runners
+docker network create tf-registry-network
+```
+
+### 2. Start all services
+
+```bash
+docker-compose up -d
+```
+
+### 3. Access the UI
+
+Open `https://runners.lan`
+
+## Default Credentials
+
+On first run, a default admin user is created:
+- **Username**: `admin`
+- **Password**: `Admin123@Test`
+
+## User Roles
+
+| Role | Permissions |
+|------|-------------|
+| **Viewer** | Read stacks, runs, runners |
+| **Operator** | Create/delete stacks and runs, manage runners, reset runner tokens |
+| **Admin** | All operator permissions + user management |
+
+## Services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| nginx | 443 | Reverse proxy with SSL |
+| backend | 8080 | REST API server |
+| frontend | 80 | Web UI |
+
+## Configuration
+
+### Environment Variables (.env)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `RUNNERS_SERVER_HOST` | Backend bind address | `0.0.0.0` |
+| `RUNNERS_SERVER_PORT` | Backend port | `8080` |
+| `RUNNERS_DATABASE_PATH` | SQLite database path | `./data/runners.db` |
+| `RUNNERS_FRONTEND_URL` | Frontend URL for nginx | `https://runners.lan` |
+| `RUNNERS_API_URL` | API URL for nginx | `https://api.runners.lan` |
+| `RUNNERS_ALLOWED_ORIGIN` | CORS allowed origin | `https://runners.lan` |
+| `RUNNERS_ENCRYPTION_KEY` | Data encryption key | (required) |
+
+### Terraform Backend Support
+
+Supported Terraform state backends for runs:
+- `local` - Local filesystem (default)
+- `azurerm` - Azure Blob Storage
+- `s3` - Amazon S3 (with assume_role support)
+- `pg` - PostgreSQL
+- `http` - Generic HTTP REST endpoint
+
+## API Endpoints
+
+### Authentication
+- `POST /api/auth/login` - Login
+- `POST /api/auth/logout` - Logout
+- `GET /api/auth/me` - Current user info
+
+### Stacks
+- `GET /api/stacks` - List stacks
+- `POST /api/stacks` - Create stack
+- `GET /api/stacks/:id` - Get stack
+- `PUT /api/stacks/:id` - Update stack
+- `DELETE /api/stacks/:id` - Delete stack
+
+### Runs
+- `GET /api/runs` - List runs
+- `POST /api/runs` - Create run
+- `GET /api/runs/:id` - Get run details
+
+### Runners
+- `GET /api/runners` - List runners
+- `POST /api/runners` - Create runner
+- `POST /api/runners/:id/heartbeat` - Runner heartbeat
+- `GET /api/runners/:id/runs` - Get runs assigned to runner
+- `POST /api/runners/:id/reset-token` - Reset runner token
+
+### Runner API (internal)
+- `PUT /api/runner/runs/:id/status` - Update run status (logs, status)
+- `PUT /api/runner/runs/:id/plan-output` - Save plan output
+- `PUT /api/runner/runs/:id/apply-output` - Save apply output
+- `PUT /api/runner/runs/:id/work-dir` - Save working directory
+- `GET /api/runner/stacks/:id` - Get stack details for runner
+
+### Users (Admin only)
+- `GET /api/users` - List users
+- `POST /api/users` - Create user
+- `POST /api/users/:id/reset-password` - Reset user password
+- `DELETE /api/users/:id` - Delete user
+
+## Docker Commands
+
+```bash
+# Build images
+docker build -t private-tf-runners-backend -f ./Dockerfile .
+docker build -t private-tf-runners-runner --no-cache -f ./cmd/runner/Dockerfile .
+
+# Restart with fresh database
+docker stop backend && docker rm backend && docker volume rm private-tf-runners_backend-data
+docker-compose up -d backend
+
+# Run runner manually (detached)
+docker build -t private-tf-runners-runner --no-cache -f ./cmd/runner/Dockerfile .
+docker run -d --name my-runner --rm --network host --add-host=api.runners.lan:127.0.0.1 --env-file .env.runners private-tf-runners-runner
+```
+
+## How to Create a New Run
+
+### Using the UI
+
+1. **Create a Stack**
+   - Go to **Stacks** → **New Stack**
+   - Fill in the form:
+     - **Name**: `my-stack`
+     - **Description**: `My Terraform stack`
+     - **Git URL**: `https://github.com/user/repo.git`
+     - **Git Folder**: `terraform/` (optional)
+     - **Provider**: `terraform` or `opentofu`
+     - **Branch**: `main`
+   - Click **Create**
+
+2. **Create a Runner** (see [How to Create a New Runner](#how-to-create-a-new-runner) below)
+
+3. **Create a Run**
+   - Go to **Runs** → **New Run**
+   - Select the **Stack** you created
+   - Select the **Runner** from the dropdown
+   - Choose the **Branch** and enter the **Commit SHA**
+   - Configure the **Backend** (e.g., S3 with bucket, key, region)
+   - Click **Create**
+
+### Using the API
+
+#### 1. Create a Stack
+
+```bash
+curl -X POST https://api.runners.lan/api/stacks \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-stack",
+    "description": "My Terraform stack",
+    "git_url": "https://github.com/user/repo.git",
+    "git_folder": "terraform/",
+    "provider": "terraform",
+    "branch": "main"
+  }'
+```
+
+#### 2. Create a Runner
+
+```bash
+curl -X POST https://api.runners.lan/api/runners \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "my-runner"
+  }'
+```
+
+The response contains `id` and `token` - save these for the runner configuration.
+
+#### 3. Create a Run
+
+```bash
+curl -X POST https://api.runners.lan/api/runs \
+  -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "stack_id": "<stack-id>",
+    "runner_id": "<runner-id>",
+    "branch": "main",
+    "commit_sha": "abc123...",
+    "backend_type": "s3",
+    "backend_config": {
+      "bucket": "my-terraform-state",
+      "key": "prod/terraform.tfstate",
+      "region": "us-east-1"
+    }
+  }'
+```
+
+## How to Create a New Runner
+
+### Using the UI
+
+1. Go to **Runners** → **New Runner**
+2. Enter a **Name** for the runner (e.g., `my-runner`)
+3. Click **Create**
+4. Copy the **Runner ID** and **Token** from the response
+5. Create the `.env.runners` file with those values
+6. Start the runner container:
+
+```bash
+docker build -t private-tf-runners-runner --no-cache -f ./cmd/runner/Dockerfile .
+docker run -d --name my-runner --rm --network host --add-host=api.runners.lan:127.0.0.1 --env-file .env.runners private-tf-runners-runner
+```
+
+### Using the API
+
+#### 1. Build the runner image
+
+```bash
+cd ../private-tf-runners
+docker build -t private-tf-runners-runner --no-cache -f ./cmd/runner/Dockerfile .
+```
+
+#### 2. Create a runner via the API
+
+```bash
+curl -X POST https://api.runners.lan/api/runners \
+  -H "Authorization: Bearer <admin-token>" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-new-runner"}'
+```
+
+Response:
+```json
+{
+  "id": "runner-id-here",
+  "token": "runner-token-here"
+}
+```
+
+#### 3. Create .env.runners file
+
+```bash
+RUNNER_ID=runner-id-here
+RUNNER_TOKEN=runner-token-here
+RUNNER_API_URL=https://api.runners.lan
+```
+
+#### 4. Start the runner
+
+```bash
+docker build -t private-tf-runners-runner --no-cache -f ./cmd/runner/Dockerfile .
+docker run -d --name my-runner --rm --network host --add-host=api.runners.lan:127.0.0.1 --env-file .env.runners private-tf-runners-runner
+```
+
+### Runner Image Details
+
+The runner image includes:
+- **Terraform** 1.13.0
+- **OpenTofu** 1.12.1
+- **Git** for repository cloning
+- Runs as non-root user `runner`
+
+## Project Structure
+
+```
+├── cmd/
+│   ├── server/main.go      # Backend entry point
+│   └── runner/main.go       # Runner entry point
+├── internal/
+│   ├── database/            # SQLite database layer
+│   ├── handlers/           # HTTP request handlers
+│   ├── middleware/         # Auth, rate limiting, security
+│   ├── models/             # Data models and permissions
+│   └── backends/           # Terraform backend schemas
+├── frontend/               # React application
+│   └── src/
+│       ├── pages/          # Page components
+│       ├── components/     # Reusable components
+│       ├── hooks/          # React hooks (useAuth)
+│       └── lib/             # API client, permissions
+├── nginx/                  # Nginx configuration
+├── docker-compose.yml      # Service orchestration
+└── Dockerfile              # Backend container
+```
+
+## Security Features
+
+- JWT authentication with short expiration
+- CSRF protection on state-changing operations
+- Security headers (CSP, X-Frame-Options, etc.)
+- SQL injection prevention (parameterized queries)
+- Rate limiting on authentication endpoints
+- bcrypt password hashing
+- Audit logging for sensitive operations

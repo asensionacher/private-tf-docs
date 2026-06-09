@@ -1,0 +1,259 @@
+---
+title: Platform Setup
+description: Set up and configure the private-tf-platform registry.
+---
+
+# Private TF Platform
+
+Self-hosted private registry for Terraform and OpenTofu modules and providers, with an HTTP state backend and a web UI.
+
+## Architecture
+
+Three subdomains are derived from `REGISTRY_HOST` in `.env` (default: `registry.lan`):
+
+| Subdomain | Purpose | Environment variable |
+| :--- | :--- | :--- |
+| `registry.lan` | Web UI | `PLATFORM_REGISTRY_HOST` |
+| `api.registry.lan` | REST API + Terraform/OpenTofu registry protocol | `PLATFORM_API_REGISTRY_HOST` |
+| `tf.registry.lan` | Terraform/OpenTofu HTTP state backend | `PLATFORM_TFSTATES_REGISTRY_HOST` |
+
+All three are served over **HTTPS on port 443** via nginx.
+
+## Quick Start
+
+### 1. Configure
+
+```bash
+cd ../private-tf-platform
+cp .env.example .env
+```
+
+Edit `.env` and set at minimum:
+
+```bash
+PLATFORM_ENCRYPTION_KEY=<openssl rand -base64 32>
+PLATFORM_POSTGRES_PASSWORD=<openssl rand -base64 24>
+PLATFORM_REGISTRY_HOST=registry.lan
+PLATFORM_API_REGISTRY_HOST=api.registry.lan
+PLATFORM_TFSTATES_REGISTRY_HOST=tf.registry.lan
+```
+
+### 2. Generate TLS certificates (optional)
+
+If your hosts don't have TLS certificates signed by a trusted CA, use this script to generate the certificates.
+
+```bash
+#!/bin/bash
+# Generates a self-signed CA and server certificates for the registry hostnames.
+# Run this once from the repo root:
+#   bash gen-certs.sh [PLATFORM_REGISTRY_HOST PLATFORM_API_REGISTRY_HOST PLATFORM_TFSTATES_REGISTRY_HOST CERTS_DIR]
+# Default PLATFORM_REGISTRY_HOST: registry.lan api.registry.lan tf.registry.lan ./nginx/certs
+
+set -euo pipefail
+
+PLATFORM_REGISTRY_HOST="${1:-registry.lan}"
+PLATFORM_API_REGISTRY_HOST="${2:-api.registry.lan}"
+PLATFORM_TFSTATES_REGISTRY_HOST="${3:-tf.registry.lan}"
+mkdir -p "$CERTS_DIR"
+
+echo "Generating certs for: $PLATFORM_REGISTRY_HOST, $PLATFORM_API_REGISTRY_HOST, $PLATFORM_TFSTATES_REGISTRY_HOST"
+echo "Output dir: $CERTS_DIR"
+
+# --- CA ---
+openssl genrsa -out "$CERTS_DIR/ca.key" 4096
+
+openssl req -x509 -new -nodes \
+  -key "$CERTS_DIR/ca.key" \
+  -sha256 -days 3650 \
+  -subj "/CN=IAC Registry CA/O=IAC Registry/C=US" \
+  -out "$CERTS_DIR/ca.crt"
+
+# --- Server key ---
+openssl genrsa -out "$CERTS_DIR/server.key" 2048
+
+# --- CSR + SAN config covering all three hostnames ---
+cat > "$CERTS_DIR/server.cnf" <<EOF
+[req]
+default_bits       = 2048
+prompt             = no
+default_md         = sha256
+distinguished_name = dn
+req_extensions     = req_ext
+
+[dn]
+CN = $PLATFORM_REGISTRY_HOST
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = $PLATFORM_REGISTRY_HOST
+DNS.2 = $PLATFORM_API_REGISTRY_HOST
+DNS.3 = $PLATFORM_TFSTATES_REGISTRY_HOST
+EOF
+
+openssl req -new \
+  -key "$CERTS_DIR/server.key" \
+  -config "$CERTS_DIR/server.cnf" \
+  -out "$CERTS_DIR/server.csr"
+
+# --- Sign with CA ---
+cat > "$CERTS_DIR/server_ext.cnf" <<EOF
+subjectAltName = DNS:$PLATFORM_REGISTRY_HOST,DNS:$PLATFORM_API_REGISTRY_HOST,DNS:$PLATFORM_TFSTATES_REGISTRY_HOST
+EOF
+
+openssl x509 -req \
+  -in "$CERTS_DIR/server.csr" \
+  -CA "$CERTS_DIR/ca.crt" \
+  -CAkey "$CERTS_DIR/ca.key" \
+  -CAcreateserial \
+  -days 3650 \
+  -sha256 \
+  -extfile "$CERTS_DIR/server_ext.cnf" \
+  -out "$CERTS_DIR/server.crt"
+
+# Cleanup intermediates
+rm -f "$CERTS_DIR/server.csr" "$CERTS_DIR/server.cnf" "$CERTS_DIR/server_ext.cnf" "$CERTS_DIR/ca.srl"
+
+echo ""
+echo "Done. Files generated:"
+echo "  $CERTS_DIR/ca.crt      <- trust this on your machines"
+echo "  $CERTS_DIR/server.crt"
+echo "  $CERTS_DIR/server.key"
+```
+
+This creates a self-signed CA and a server certificate covering all three subdomains, saved to `nginx/certs/`. The certs are gitignored — regenerate them on each new clone.
+
+### 3. Trust the CA certificate
+
+The CA must be trusted on every machine that will access the registry — both the server and any machine running Terraform or OpenTofu. Copy `nginx/certs/ca.crt` to each machine and run the appropriate command:
+
+**Arch / CachyOS**
+```bash
+sudo trust anchor --store ca.crt && sudo update-ca-trust
+```
+
+**Debian / Ubuntu**
+```bash
+sudo cp ca.crt /usr/local/share/ca-certificates/iac-registry-ca.crt
+sudo update-ca-certificates
+```
+
+**RHEL / Fedora / CentOS**
+```bash
+sudo cp ca.crt /etc/pki/ca-trust/source/anchors/iac-registry-ca.crt
+sudo update-ca-trust extract
+```
+
+**macOS**
+```bash
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ca.crt
+```
+
+**Windows** (run in an elevated PowerShell)
+```powershell
+Import-Certificate -FilePath ca.crt -CertStoreLocation Cert:\LocalMachine\Root
+```
+
+### 4. Add hostnames to `/etc/hosts`
+
+```
+<server-ip>  registry.lan  api.registry.lan  tf.registry.lan
+```
+
+### 5. Start
+
+```bash
+docker compose up -d --build
+```
+
+Open `https://registry.lan`.
+
+## Terraform / OpenTofu CLI Setup
+
+### Why HTTPS is Required
+
+Terraform and OpenTofu only send `Authorization` headers over HTTPS. If the registry endpoint is plain HTTP, the CLI silently omits credentials and every request to a private namespace fails with a 401.
+
+Public namespaces (`is_public = true`) work over HTTP. Private namespaces require HTTPS — that is the only reason TLS is set up here.
+
+### Configure the CLI
+
+Add to `~/.terraformrc` (Terraform) or `~/.tofurc` (OpenTofu):
+
+```hcl
+host "api.registry.lan" {
+  services = {
+    "providers.v1" = "https://api.registry.lan/v1/providers/"
+    "modules.v1"   = "https://api.registry.lan/v1/modules/"
+  }
+}
+
+credentials "api.registry.lan" {
+  token = "<api-key-from-the-web-ui>"
+}
+```
+
+Generate an API key in the Web UI under **API Keys**.
+
+### Use a Private Provider
+
+```hcl
+terraform {
+  required_providers {
+    myprovider = {
+      source  = "api.registry.lan/my-org/myprovider"
+      version = "~> 1.0"
+    }
+  }
+}
+```
+
+## HTTP State Backend
+
+Store remote Terraform/OpenTofu state without S3 or Consul.
+
+The state backend uses **HTTP Basic Auth** — the same username and password you use to log into the web UI. Any user (admin or reader) can access the state backend.
+
+> **Never hardcode credentials in `.tf` files.** Use environment variables instead — Terraform and OpenTofu read `TF_HTTP_USERNAME` and `TF_HTTP_PASSWORD` automatically.
+
+```bash
+export TF_HTTP_USERNAME="myuser"
+export TF_HTTP_PASSWORD="mypassword"
+```
+
+```hcl
+terraform {
+  backend "http" {
+    address        = "https://tf.registry.lan/api/tfstate/<deployment-id>"
+    lock_address   = "https://tf.registry.lan/api/tfstate/<deployment-id>"
+    unlock_address = "https://tf.registry.lan/api/tfstate/<deployment-id>"
+    lock_method    = "LOCK"
+    unlock_method  = "UNLOCK"
+  }
+}
+```
+
+Use the same URL for all three fields. OpenTofu/Terraform appends `:<workspace>` automatically for named workspaces.
+
+State files live in the `registry-data` Docker volume at `/app/data/tfstates/<deployment-id>/`. The Web UI's **TF State** page lets you browse, inspect, and manage them.
+
+## Common Commands
+
+```bash
+# Start
+docker compose up -d --build
+
+# Logs
+docker compose logs -f backend
+
+# Stop (keeps data)
+docker compose down
+
+# Stop and delete all data
+docker compose down -v
+```
+
+## Backup
+
+Back up the `registry-data` Docker volume — it holds all provider binaries and Terraform state files.

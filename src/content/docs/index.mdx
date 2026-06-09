@@ -1,0 +1,31 @@
+---
+title: Private TF
+description: Self-hosted private Terraform/OpenTofu registry and runners platform.
+template: splash
+hero:
+  title: Private TF
+  tagline: Complete infrastructure-as-code platform. Private registry for Terraform/OpenTofu modules and providers, plus self-hosted deployment runners.
+  image:
+    file: ../../assets/logo.svg
+  actions:
+    - text: Get Started
+      link: /guides/platform/
+      icon: right-arrow
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid stagger>
+	<Card title="Platform" icon="rocket">
+		Private Terraform/OpenTofu registry with Web UI, REST API, and HTTP state backend.
+		Store modules, providers, and manage remote state for your infrastructure.
+	</Card>
+	<Card title="Runners" icon="approve-check">
+		Self-hosted deployment platform for managing Terraform/OpenTofu stacks and runs.
+		Execute Terraform at scale with a friendly web interface.
+	</Card>
+	<Card title="Integration" icon="puzzle">
+		Run both platform and runners together with a unified nginx reverse proxy.
+		Single certificate, shared network, centralized configuration.
+	</Card>
+</CardGrid>

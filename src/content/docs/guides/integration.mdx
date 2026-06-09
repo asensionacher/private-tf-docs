@@ -1,0 +1,471 @@
+---
+title: Integration Guide
+description: Run private-tf-platform and private-tf-runners together.
+---
+
+# Integration Guide
+
+The `private-tf-integration` project provides a pre-configured docker-compose setup that runs both **private-tf-platform** and **private-tf-runners** together behind a unified nginx reverse proxy.
+
+## Architecture
+
+This integration runs all services on a single Docker network with a unified nginx reverse proxy handling SSL termination and routing:
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │           nginx (443)                   │
+                    │                                         │
+clients ──────────► │  registry.lan  ──► frontend-platform    │
+                    │  api.registry.lan ──► backend-platform  │
+                    │  tf.registry.lan ──► backend-platform   │
+                    │  runners.lan ──► frontend-runners       │
+                    │  api.runners.lan ──► backend-runners    │
+                    └─────────────────────────────────────────┘
+                              │
+            ┌─────────────────┴───────────────────────────────────┐
+            │       tf-registry-network                           │
+            │                                                     │
+            │  ┌─────────────┐  ┌─────────────┐  ┌──────────────┐ │
+            │  │  Platform   │  │   Runners   │  │  Dettached   │ │
+            │  │  Services   │  │  Services   │  │  Runner      │ │
+            │  └─────────────┘  └─────────────┘  └──────────────┘ │
+            └─────────────────────────────────────────────────────┘
+```
+
+## Services
+
+| Service | Description |
+|---------|-------------|
+| `nginx` | Reverse proxy with SSL termination |
+| `frontend-platform` | Platform Web UI (port 3000) |
+| `backend-platform` | Platform API server |
+| `postgres-platform` | PostgreSQL database for platform |
+| `frontend-runners` | Runners Web UI (port 80) |
+| `backend-runners` | Runners API server (port 8080) |
+| `my-runner` | Runner executor |
+
+## Quick Start
+
+### 1. Configure
+
+```bash
+mkdir -t private-tf/private-tf-integration/nginx/certs
+touch private-tf/private-tf-integration/.env /private-tf/private-tf-integration/.env.runners /private-tf/private-tf-integration/compose.yml /private-tf/private-tf-integration/nginx/nginx.conf.template
+
+cd private-tf
+git clone https://github.com/asensionacher/private-tf-runners.git
+git clone https://github.com/asensionacher/private-tf-platform.git
+```
+
+Edit `.env` with your settings:
+
+```bash
+PLATFORM_ENCRYPTION_KEY=<openssl rand -base64 32>
+PLATFORM_POSTGRES_PASSWORD=<openssl rand -base64 32>
+PLATFORM_REGISTRY_HOST=registry.lan
+PLATFORM_API_REGISTRY_HOST=api.registry.lan
+PLATFORM_TFSTATES_REGISTRY_HOST=tf.registry.lan
+PLATFORM_POSTGRES_HOST=postgres-platform
+
+RUNNERS_SERVER_HOST=0.0.0.0
+RUNNERS_SERVER_PORT=8080
+RUNNERS_DATABASE_PATH=./data/runners.db
+RUNNERS_ENV=production
+
+RUNNERS_FRONTEND_URL=https://runners.lan
+RUNNERS_API_URL=https://api.runners.lan
+RUNNERS_ALLOWED_ORIGIN=https://runners.lan
+
+RUNNERS_ENCRYPTION_KEY=<openssl rand -base64 32>
+```
+
+Edit `compose.yml` with:
+
+```yml
+services:
+  nginx:
+    image: nginx:alpine
+    container_name: nginx-tf-integration
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - RUNNERS_FRONTEND_HOST=${RUNNERS_FRONTEND_HOST:-runners.lan}
+      - RUNNERS_API_HOST=${RUNNERS_API_HOST:-api.runners.lan}
+      - PLATFORM_REGISTRY_HOST=${PLATFORM_REGISTRY_HOST:-registry.lan}
+      - PLATFORM_API_REGISTRY_HOST=${PLATFORM_API_REGISTRY_HOST:-api.registry.lan}
+      - PLATFORM_TFSTATES_HOST=${PLATFORM_TFSTATES_HOST:-tf.registry.lan}
+    volumes:
+      - ./nginx/nginx.conf.template:/etc/nginx/templates/nginx.conf.template:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    command: sh -c "envsubst '$$RUNNERS_FRONTEND_HOST $$RUNNERS_API_HOST $$PLATFORM_REGISTRY_HOST $$PLATFORM_API_REGISTRY_HOST $$PLATFORM_TFSTATES_HOST' < /etc/nginx/templates/nginx.conf.template > /etc/nginx/nginx.conf && nginx -g 'daemon off;'"
+    depends_on:
+      - frontend-runners
+      - backend-runners
+      - frontend-platform
+      - backend-platform
+      - postgres-platform
+    #restart: unless-stopped
+    networks:
+      - tf-registry-network
+  backend-runners:
+    build:
+      context: ../private-tf-runners
+      dockerfile: Dockerfile
+    container_name: private-tf-runners-backend
+    expose:
+      - "8080"
+    volumes:
+      - backend-data-runners:/data
+    env_file:
+      - .env
+    environment:
+      - RUNNERS_DATABASE_PATH=/data/runners.db
+    restart: unless-stopped
+    networks:
+      - tf-registry-network
+
+  frontend-runners:
+    build:
+      context: ../private-tf-runners/frontend
+      dockerfile: Dockerfile
+    container_name: private-tf-runners-frontend
+    expose:
+      - "80"
+    depends_on:
+      - backend-runners
+    restart: unless-stopped
+    environment:
+      - VITE_API_URL=${RUNNERS_API_URL}
+    networks:
+      - tf-registry-network
+  postgres-platform:
+    image: postgres:17-alpine
+    container_name: postgres-platform
+    ports:
+      - "${POSTGRES_PORT_EXTERNAL:-5432}:5432"
+    environment:
+      - POSTGRES_DB=registry
+      - POSTGRES_USER=registry
+      - POSTGRES_PASSWORD=${PLATFORM_POSTGRES_PASSWORD:-registry-password-change-me}
+    volumes:
+      - postgres-data-platform:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - tf-registry-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U registry"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend-platform:
+    build:
+      context: ../private-tf-platform
+      dockerfile: backend/Dockerfile
+    container_name: backend-platform
+    volumes:
+      - registry-data-platform:/app/data
+    environment:
+      - GIN_MODE=release
+      - PORT=9080
+      - BACKEND_HOST=${API_PLATFORM_REGISTRY_HOST:-api.registry.lan}
+      - FRONTEND_HOST=${PLATFORM_REGISTRY_HOST:-registry.lan}
+      - FRONTEND_PORT=443
+      - VITE_DEV_PORT=5173
+      - POSTGRES_HOST=${PLATFORM_POSTGRES_HOST:-postgres-platform}
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=registry
+      - POSTGRES_USER=registry
+      - POSTGRES_PASSWORD=${PLATFORM_POSTGRES_PASSWORD:-registry-password-change-me}
+      - ENCRYPTION_KEY=${PLATFORM_ENCRYPTION_KEY:-change-this-to-a-secure-32-char-key!}
+      - PLATFORM_REGISTRY_HOST=${PLATFORM_REGISTRY_HOST:-registry.lan}
+      - PLATFORM_API_REGISTRY_HOST=${PLATFORM_API_REGISTRY_HOST:-api.registry.lan}
+      - PLATFORM_TFSTATES_HOST=${PLATFORM_TFSTATES_REGISTRY_HOST:-tf.registry.lan}
+    restart: unless-stopped
+    networks:
+      - tf-registry-network
+    depends_on:
+      postgres-platform:
+        condition: service_healthy
+
+  frontend-platform:
+    build:
+      context: ../private-tf-platform/frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_REGISTRY_HOST=${PLATFORM_API_REGISTRY_HOST:-api.registry.lan}
+        - VITE_REGISTRY_PORT=443
+        - VITE_API_BASE_URL=https://${PLATFORM_API_REGISTRY_HOST:-api.registry.lan}/api
+    environment:
+      - PORT=3000
+    depends_on:
+      - backend-platform
+    restart: unless-stopped
+    networks:
+      - tf-registry-network
+volumes:
+  backend-data-runners:
+    driver: local
+  postgres-data-platform:
+  registry-data-platform:
+networks:
+  tf-registry-network:
+    name: tf-registry-network
+    driver: bridge
+```
+
+And `private-tf-integration/nginx/nginx.conf.template` with:
+
+```bash
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    sendfile        on;
+    keepalive_timeout 65;
+
+    # -------------------------------------------------------------------------
+    # HTTP -> HTTPS redirect for all vhosts
+    # -------------------------------------------------------------------------
+    server {
+        listen 80;
+        server_name ${PLATFORM_REGISTRY_HOST} ${PLATFORM_API_REGISTRY_HOST} ${PLATFORM_TFSTATES_HOST} ;
+        return 301 https://$host$request_uri;
+    }
+
+    # -------------------------------------------------------------------------
+    # ${PLATFORM_REGISTRY_HOST} — Frontend UI
+    # -------------------------------------------------------------------------
+    server {
+        listen 443 ssl;
+        server_name ${PLATFORM_REGISTRY_HOST};
+
+        ssl_certificate     /etc/nginx/certs/server.crt;
+        ssl_certificate_key /etc/nginx/certs/server.key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        ssl_ciphers         HIGH:!aNULL:!MD5;
+
+        location / {
+            proxy_pass         http://frontend-platform:3000;
+            proxy_http_version 1.1;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_set_header   Upgrade           $http_upgrade;
+            proxy_set_header   Connection        "upgrade";
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # ${PLATFORM_API_REGISTRY_HOST} — Backend API + Terraform Registry Protocol
+    # Covers: /api /v1 /.well-known /downloads /shasums
+    # -------------------------------------------------------------------------
+    server {
+        listen 443 ssl;
+        server_name ${PLATFORM_API_REGISTRY_HOST};
+
+        ssl_certificate     /etc/nginx/certs/server.crt;
+        ssl_certificate_key /etc/nginx/certs/server.key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        ssl_ciphers         HIGH:!aNULL:!MD5;
+
+        # Large uploads for provider binaries
+        client_max_body_size 500m;
+
+        location / {
+            proxy_pass         http://backend-platform:9080;
+            proxy_http_version 1.1;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_pass_request_headers on;
+        }
+    }
+
+    # -------------------------------------------------------------------------
+    # ${PLATFORM_TFSTATES_HOST} — Terraform HTTP State Backend
+    # Dedicated subdomain for /api/tfstate/:deploymentId
+    # Supports GET / POST / DELETE / LOCK / UNLOCK
+    # -------------------------------------------------------------------------
+    server {
+        listen 443 ssl;
+        server_name ${PLATFORM_TFSTATES_HOST};
+
+        ssl_certificate     /etc/nginx/certs/server.crt;
+        ssl_certificate_key /etc/nginx/certs/server.key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        ssl_ciphers         HIGH:!aNULL:!MD5;
+
+        location / {
+            proxy_pass         http://backend-platform:9080;
+            proxy_http_version 1.1;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_pass_request_headers on;
+        }
+    }
+    server {
+        listen 443 ssl http2;
+        server_name ${RUNNERS_FRONTEND_HOST};
+
+        ssl_certificate /etc/nginx/certs/server_runners.crt;
+        ssl_certificate_key /etc/nginx/certs/server_runners.key;
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+        ssl_prefer_server_ciphers off;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 10m;
+
+        location /api/ {
+            proxy_pass http://backend-runners:8080;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        location / {
+            proxy_pass http://frontend-runners:80;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name ${RUNNERS_API_HOST};
+
+        ssl_certificate /etc/nginx/certs/api_runners.crt;
+        ssl_certificate_key /etc/nginx/certs/api_runners.key;
+
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+        ssl_prefer_server_ciphers off;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 10m;
+
+        location / {
+            proxy_pass http://backend-runners:8080;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            add_header 'Access-Control-Allow-Origin' '$http_origin' always;
+            add_header 'Access-Control-Allow-Credentials' 'true' always;
+            add_header 'Access-Control-Allow-Methods' 'GET, POST, PUT, DELETE, OPTIONS' always;
+            add_header 'Access-Control-Allow-Headers' 'Content-Type, Authorization, X-CSRF-Token' always;
+        }
+    }
+}
+
+```
+
+### 2. Untrusted certificates and host files
+
+If needed, create untrusted certificates for all URLS and add those on hosts file pointing to localhost
+
+### 5. Start
+
+```bash
+docker compose up -d --build
+```
+
+## Access Points
+
+After starting, access the services at:
+
+| Service | URL |
+|---------|-----|
+| Platform Web UI | https://registry.lan |
+| Platform API | https://api.registry.lan |
+| State Backend | https://tf.registry.lan |
+| Runners Web UI | https://runners.lan |
+| Runners API | https://api.runners.lan |
+
+## Example
+
+Let's execute one test that will use all services in both projects. It will use internal modules and providers, http backend and runner executor. This example will be done using `Terraform`.
+
+1. Go to [https://registry.lan] and login with username and password (by default is `admin` - `admin`).
+2. Go to `namespace` and create a new namespace with name `my-org`. Let it private.
+3. Create a new provider called `time` with `Git Repository URL` [https://github.com/hashicorp/terraform-provider-time] and in namespace select `my-org`.
+4. Download from [here](https://releases.hashicorp.com/terraform-provider-time/0.14.0/terraform-provider-time_0.14.0_linux_amd64.zip) the provider zip. We selected AMD64 because is the runners architecture.
+5. Go to your recently created provider and on version `0.14.0` click on the eye, then on the green line and upload the downloaded provider on `AMD64`.
+6. Do the same for provider `random`, which repo url is [https://github.com/hashicorp/terraform-provider-random], the name is `random`, the version is `3.9.0` and you can download the zip from [here](https://releases.hashicorp.com/terraform-provider-random/3.9.0/terraform-provider-random_3.9.0_darwin_amd64.zip).
+7. Now let's create a module. Select `my-org` namespace, module name is `naming`, provider `azure` and Git Repository URL [https://github.com/asensionacher/terraform-azurerm-naming].
+8. Go inside the module and click on the eye next to version `0.0.1`.
+
+Now we have created modules and providers but as the namespace is private we need an API key, so create one on `API Keys` section and save the value for future use.
+
+We are done by now on `private-tf-platform`, so let's create an `stack` and a runners on `private-tf-runners`.
+
+1. Login into [https://runners.lan/login] (by default is `admin` - `Admin123@Test`).
+2. Go to runners section and add a runner. You should add the values in `.env.runners`, for example:
+
+```bash
+RUNNER_ID=37O2lULLY-jGOoc8zOJ1kg==
+RUNNER_TOKEN=dWm_W5bgzNA6x-BmWx8A4p9cWYuyHLKNdwTzl5WW7cY=
+RUNNER_API_URL=https://api.runners.lan
+```
+
+5. Create in `private-tf-runners/cmd/runner/rcfiles` two files called `.terraformrc` and `.tofurc`. This files will be copied to your runner and will set the credentials to download the modules and providers created before. The content of both files have to be the same and should be like this:
+   
+```bash
+host "api.registry.lan" {
+  services = {
+    "providers.v1" = "https://api.registry.lan/v1/providers/"
+    "modules.v1" = "http://api.registry.lan/v1/modules/"
+  }
+}
+
+credentials "api.registry.lan" {
+  token = "tfr_478c98b76c52d496a0e26a2563336eccc22a5b93d49210ab56041d72c6f984d2"
+}
+```
+
+Where the token is the `API Key` created on the `private-tf-platform` before.
+6. Run the runner on a dettached docker container. Open a terminal, go to `private-tf-runners` folder and run:
+
+```bash
+docker build -t private-tf-runners-runner --no-cache -f ./cmd/runner/Dockerfile .
+docker run -d --name my-runner --rm --network host --add-host=api.runners.lan:127.0.0.1 --env-file ../private-tf-integration/.env.runners private-tf-runners-runner
+```
+
+7. On [https://runners.lan/runners], the runner should appear as `online`.
+8. Let's create a stack on [https://runners.lan/stacks]. This stack is the code to run from the runner. We will use a repo that have an example using both providers and the module created on the platform, so click on `Create stack`.
+   1. On `name`, set someone.
+   2. On `Git Repository URL` set [https://github.com/asensionacher/testtf] and click on `Fetch Refs`.
+   3. Select `Terraform` as `provider`.
+   4. Select `all-private` branch.
+   5. Click on `Create stack`.
+9. Now, on the stacks, click on the `play/run stack` button.
+   1.  Select the previously created stack (selected by default).
+   2.  Select our branch.
+   3.  Select our runner.
+   4.  Select `HTTP` as `Backend type`.
+   5.  As `Authentication Method` select `basic`
+   6.  On `address`, `lock_address` and `unlock_address` set `https://tf.registry.lan/api/tfstate/naming.tfstate` where `naming.tfstate` is the name of the file where the `tfstate` will be saved on our private backend.
+   7.  On `username` and `password` set the credentials for the `private-tf-platform` (by default is `admin` - `admin`).
+   8.  On `Terraform Variables Files`, set `suffix.tfvars` and `prefix.tfvars`.
+   9.  Click on `Create run`.
+10. Now you are in the run page. This will be updated or press F5 for checking the status. You will see the `terraform init` and `terraform plan` logs. Once both finishes, you can accept or reject the plan. Please accept it to see the `terraform apply` and the `terraform output` logs.
+
+Now you're done! You can check in the init that the modules and the provider were downloaded from [api.registry.lan] and also you can check the tfstate on [https://registry.lan/tfstate].
